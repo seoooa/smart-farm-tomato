@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+build/
+dist/
+wheels/
+unsloth_compiled_cache/
+
+# Virtual environments
+.venv
+
+# Data files
+data/*
+!data/.gitkeep
+
+# Result files
+result/*
+!result/.gitkeep
+
+# Demo files
+.gradio/
+.gradio/*
+
+# Model weights
+src/models/**/weights/
+*.safetensors
+*.pt

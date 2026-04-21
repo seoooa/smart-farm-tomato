@@ -1,0 +1,29 @@
+# ── 일반 패키지 ─────────────────────────────────────────────────────────────
+autorootcwd==1.0.1
+click==8.3.1
+opencv-python-headless==4.13.0.92
+Pillow==12.1.1
+tqdm==4.67.3
+numpy==2.2.6
+PyYAML==6.0.3
+matplotlib==3.10.8
+ultralytics==8.4.21
+gradio==6.13.0
+unsloth_zoo==0.1.2
+
+# ── Transformers / LoRA ──────────────────────────────────────────────────────
+transformers==5.3.0
+accelerate==1.13.0
+peft
+bitsandbytes
+
+# ── PyTorch (CUDA 12.x) ──────────────────────────────────────────────────────
+# 아래 명령으로 먼저 설치:
+# uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch==2.10.0
+torchvision==0.25.0
+
+# ── unsloth (FastVisionModel) ────────────────────────────────────────────────
+# torch 설치 후 별도로 실행:
+# uv pip install "unsloth @ git+https://github.com/unslothai/unsloth.git"
+# uv pip install unsloth_zoo
