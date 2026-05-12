@@ -42,7 +42,6 @@ _DEFAULT_DEVICE  = 3
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
-
 # ── 유틸 ──────────────────────────────────────────────────────────────────────
 
 def _crop_bbox(
@@ -100,6 +99,7 @@ def step1_detect(
     )
     detections = yolo_infer.parse_results(raw_results, yolo_model.names)
     detections = _merge_to_tomato(detections)
+    detections.sort(key=lambda d: d.xyxy[0])  # x1 오름차순 → 왼쪽부터 id=1
     img_bgr = cv2.imread(str(image_path))
     return img_bgr, detections
 
@@ -143,10 +143,10 @@ def step3_harvest(
     model,
     tokenizer,
 ) -> HarvestResult | None:
-    """ripe 토마토만 골라 전체 이미지에서 최적 수확 대상을 선정합니다.
+    """ripe 토마토별 harvest score를 예측한 뒤 최종 수확 대상을 고릅니다.
 
     Returns:
-        HarvestResult, 또는 ripe 후보 없음 / 파싱 실패 시 None.
+        HarvestResult, 또는 ripe 후보가 없으면 None.
     """
     ripe_tomatoes = [
         {"id": i + 1, "bbox": list(bbox)}
@@ -156,7 +156,7 @@ def step3_harvest(
     if not ripe_tomatoes:
         return None
 
-    img_pil = PILImage.fromarray(img_bgr[..., ::-1])
+    img_pil = PILImage.fromarray(img_bgr[..., ::-1]).convert("RGB")
     return harvest_infer.predict(img_pil, ripe_tomatoes, model, tokenizer)
 
 
@@ -267,7 +267,6 @@ def save_results_json(
         harvest_out = {
             "selected_tomato_id": selected_id,
             "selected_bbox": selected_bbox,
-            "reasoning": harvest_result.reasoning,
             "tomato_scores": [
                 {
                     "id": s.id,
@@ -275,6 +274,7 @@ def save_results_json(
                     "visibility_score": s.visibility_score,
                     "isolation_score":  s.isolation_score,
                     "total_score":      s.total_score,
+                    "bbox_area":        s.bbox_area,
                 }
                 for s in harvest_result.tomato_scores
             ],
@@ -343,7 +343,7 @@ def run_single(
 )
 @click.option(
     "--harvest-model", "harvest_model_path", default=_DEFAULT_HARVEST_MODEL, show_default=True,
-    help="Harvest 선택 모델 경로 (unsloth 저장 형식)",
+    help="Harvest score 모델 경로 (unsloth 저장 형식)",
 )
 @click.option("--conf",   default=_DEFAULT_CONF,   show_default=True, help="YOLO confidence 임계값")
 @click.option("--iou",    default=_DEFAULT_IOU,    show_default=True, help="YOLO NMS IoU 임계값")
@@ -362,7 +362,7 @@ def main(
     device: int,
     load_in_4bit: bool,
 ):
-    """이미지(또는 폴더)에 대해 YOLO 탐지 → Ripeness 분류 → Harvest 선택 파이프라인을 실행합니다."""
+    """이미지(또는 폴더)에 대해 YOLO 탐지 → Ripeness 분류 → Harvest score 선택 파이프라인을 실행합니다."""
 
     # ── 입력 목록 수집 ────────────────────────────────────────────────────────
     if input_path.is_dir():

@@ -1,12 +1,12 @@
-"""Harvest selection inference using Qwen3.5-0.8B (unsloth).
+"""Harvest score inference using Qwen3.5-0.8B (unsloth).
 
 Pipeline position:
-    YOLO detection → Ripeness classification → **Harvest selection** ← here
+    YOLO detection → Ripeness classification → **Harvest score prediction** ← here
 
 Public API
 ----------
 load_model(model_path, load_in_4bit) → (model, tokenizer)
-run_inference(pil_image, ripe_tomatoes, model, tokenizer) → raw_str
+run_inference(pil_image, ripe_tomatoes, model, tokenizer) → list[str]
 parse_output(raw_str) → dict | None
 predict(pil_image, ripe_tomatoes, model, tokenizer) → HarvestResult | None
 """
@@ -23,64 +23,63 @@ from PIL import Image
 # ── 프롬프트 ──────────────────────────────────────────────────────────────────
 
 SYSTEM_MESSAGE = """\
-You are a tomato harvest-selection annotation assistan.
+You are a tomato harvest score prediction assistant.
 
-Your task is to evaluate all ripe tomato candidates in the image and generate one output JSON object.
-You must assign scores to every tomato listed in ripe_tomatoes and always select the single best tomato for harvest.
+Your task is to score ONE target tomato using two images:
+1. The first image is the full scene image.
+2. The second image is a crop image of the target tomato.
 
-For each candidate, assign:
-- ripeness_score (0-10): redness and maturity
-- visibility_score (0-10): visibility considering leaves, stems, blur, and image border
-- isolation_score (0-10): separation from other tomatoes
+Input metadata gives the full image size, target tomato id, and target_bbox in full-image coordinates.
 
-Rules:
-- Compare tomatoes RELATIVE to each other within the same image.
-- Set total_score = ripeness_score + visibility_score + isolation_score.
-- Always select exactly one candidate ID from ripe_tomatoes.
+Score definitions:
+- ripeness_score (0-10): judge only color maturity and redness of the target tomato.
+- visibility_score (0-10): judge only how clearly the target tomato itself can be seen. Penalize leaves, stems, blur, darkness, glare, and border truncation. Do not penalize nearby tomatoes unless they occlude the target tomato.
+- isolation_score (0-10): judge only tomato-to-tomato separation. Penalize touching, overlap, clustering, and crowding by other tomatoes. Do not penalize leaves, stems, blur, or color here.
+
+Evidence usage:
+- Use the crop image mainly for ripeness and visibility.
+- Use the full image mainly for isolation and scene context.
+- Score only the target tomato, not the whole image.
+- Assign each criterion independently. Do not let a high score in one criterion compensate for another criterion.
+
+Score anchors:
+- 0-2: poor
+- 3-4: low
+- 5-6: moderate
+- 7-8: good
+- 9-10: excellent
+
+Return only valid JSON. No markdown, no extra text.
 """
 
 USER_PROMPT = """\
-Choose the best harvest tomato from ripe_tomatoes.
+Score the target tomato.
 
 Input:
 {{
   "image_size": {image_size},
-  "ripe_tomatoes": {ripe_tomatoes}
+  "target_tomato_id": {target_tomato_id},
+  "target_bbox": {target_bbox}
 }}
 
-Example JSON output:
+Return exactly one valid JSON object:
 {{
-  "selected_tomato_id": 2,
-  "reasoning": "Tomato 2 is more uniformly red and clearly isolated than the other ripe candidates."
-  "tomato_scores": [
-    {{
-      "id": 1,
-      "ripeness_score": 7,
-      "visibility_score": 8,
-      "isolation_score": 5,
-      "total_score": 20
-    }},
-    {{
-      "id": 2,
-      "ripeness_score": 9,
-      "visibility_score": 8,
-      "isolation_score": 7,
-      "total_score": 24
-    }}
-  ]
+  "id": {target_tomato_id},
+  "ripeness_score": 0,
+  "visibility_score": 0,
+  "isolation_score": 0
 }}
 
-Rules:
-- Score every tomato in ripe_tomatoes.
-- total_score must equal ripeness_score + visibility_score + isolation_score.
-- tomato_scores must contain one score object for every tomato in ripe_tomatoes.
-- reasoning must be exactly ONE short sentence to explain the selected tomato using comparative evidence based on the scores.
-- Output only the JSON object, nothing else.
+Requirements:
+- The output id must equal target_tomato_id.
+- Scores must be integers from 0 to 10.
+- Do not output total_score, selected_tomato_id, or reasoning.
+- Output only the JSON object and nothing else.
 """
 
-# max_new_tokens 계산 상수
-_BASE_TOK = 100
-_PER_TOMATO_TOK = 50
+MAX_NEW_TOKENS = 80
+CROP_SIZE = 512
+CROP_PADDING = 20
 
 
 # ── 결과 데이터클래스 ──────────────────────────────────────────────────────────
@@ -92,12 +91,13 @@ class TomatoScore:
     visibility_score: int
     isolation_score: int
     total_score: int
+    bbox_area: int = 0
+    raw: str = ""
 
 
 @dataclass
 class HarvestResult:
     selected_tomato_id: int
-    reasoning: str
     tomato_scores: list[TomatoScore] = field(default_factory=list)
     raw: str = ""
 
@@ -123,6 +123,46 @@ def load_model(model_path: str, load_in_4bit: bool = False):
     return model, tokenizer
 
 
+# ── 유틸 ──────────────────────────────────────────────────────────────────────
+
+def _bbox_area(bbox: list[int | float]) -> int:
+    try:
+        x1, y1, x2, y2 = bbox
+        return max(0, int(x2) - int(x1)) * max(0, int(y2) - int(y1))
+    except Exception:
+        return 0
+
+
+def _safe_int_score(value, default: int = 0) -> int:
+    try:
+        return max(0, min(10, int(value)))
+    except Exception:
+        return default
+
+
+def _crop_candidate(
+    pil_image: Image.Image,
+    bbox: list[int | float],
+) -> Image.Image:
+    W, H = pil_image.size
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, int(x1) - CROP_PADDING)
+    y1 = max(0, int(y1) - CROP_PADDING)
+    x2 = min(W, int(x2) + CROP_PADDING)
+    y2 = min(H, int(y2) + CROP_PADDING)
+    x1, x2 = min(x1, x2), max(x1, x2)
+    y1, y2 = min(y1, y2), max(y1, y2)
+    if x2 <= x1:
+        x2 = x1 + 1
+    if y2 <= y1:
+        y2 = y1 + 1
+
+    crop = pil_image.crop((x1, y1, x2, y2)).convert("RGB")
+    if crop.size != (CROP_SIZE, CROP_SIZE):
+        crop = crop.resize((CROP_SIZE, CROP_SIZE), Image.BICUBIC)
+    return crop
+
+
 # ── 추론 ──────────────────────────────────────────────────────────────────────
 
 def run_inference(
@@ -130,66 +170,72 @@ def run_inference(
     ripe_tomatoes: list[dict[str, Any]],
     model,
     tokenizer,
-) -> str:
-    """모델에 이미지와 ripe_tomatoes를 입력하고 raw 문자열을 반환합니다.
+) -> list[str]:
+    """각 ripe tomato에 대해 full image + crop image를 배치로 넣고 raw 출력 리스트를 반환합니다."""
+    if not ripe_tomatoes:
+        return []
 
-    Args:
-        pil_image: 원본 PIL 이미지.
-        ripe_tomatoes: [{"id": int, "bbox": [x1, y1, x2, y2]}, ...] 형태의 리스트.
-        model: load_model()로 얻은 모델.
-        tokenizer: load_model()로 얻은 토크나이저.
+    full_img = pil_image.convert("RGB")
+    image_size = list(full_img.size)
+    all_images = []
+    input_texts = []
 
-    Returns:
-        모델이 생성한 raw 텍스트.
-    """
-    image_size = list(pil_image.size)  # [W, H]
-    prompt_text = USER_PROMPT.format(
-        image_size=json.dumps(image_size),
-        ripe_tomatoes=json.dumps(ripe_tomatoes, ensure_ascii=False),
-    )
-    template_msgs = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_MESSAGE}]},
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": prompt_text},
-            ],
-        },
-    ]
-    input_text = tokenizer.apply_chat_template(
-        template_msgs,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
+    for tomato in ripe_tomatoes:
+        crop = _crop_candidate(full_img, tomato["bbox"])
+        prompt_text = USER_PROMPT.format(
+            image_size=json.dumps(image_size),
+            target_tomato_id=json.dumps(tomato["id"]),
+            target_bbox=json.dumps(tomato["bbox"]),
+        )
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": SYSTEM_MESSAGE}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "image"},
+                    {"type": "text", "text": prompt_text},
+                ],
+            },
+        ]
+        input_texts.append(
+            tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        )
+        all_images.extend([full_img, crop])
+
+    tokenizer.padding_side = "left"
     inputs = tokenizer(
-        pil_image,
-        input_text,
+        images=all_images,
+        text=input_texts,
+        padding=True,
         add_special_tokens=False,
         return_tensors="pt",
     ).to("cuda")
 
-    max_new_tokens = _BASE_TOK + _PER_TOMATO_TOK * len(ripe_tomatoes)
-
     with torch.no_grad():
         out_ids = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=MAX_NEW_TOKENS,
             do_sample=False,
             use_cache=True,
+            pad_token_id=getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", None),
         )
-    generated = out_ids[0][inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+    input_len = inputs["input_ids"].shape[1]
+    return [
+        tokenizer.decode(out[input_len:], skip_special_tokens=True).strip()
+        for out in out_ids
+    ]
 
 
 # ── 파싱 ──────────────────────────────────────────────────────────────────────
 
 def parse_output(raw: str) -> dict[str, Any] | None:
-    """raw 문자열에서 JSON을 추출하고 파싱합니다.
-
-    Returns:
-        파싱된 dict, 또는 실패 시 None.
-    """
+    """raw 문자열에서 harvest score JSON을 추출하고 파싱합니다."""
     try:
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if match:
@@ -199,23 +245,29 @@ def parse_output(raw: str) -> dict[str, Any] | None:
     return None
 
 
-def _dict_to_result(parsed: dict[str, Any], raw: str) -> HarvestResult:
-    """파싱된 dict를 HarvestResult 데이터클래스로 변환합니다."""
-    scores = [
-        TomatoScore(
-            id=s.get("id", -1),
-            ripeness_score=s.get("ripeness_score", 0),
-            visibility_score=s.get("visibility_score", 0),
-            isolation_score=s.get("isolation_score", 0),
-            total_score=s.get("total_score", 0),
-        )
-        for s in parsed.get("tomato_scores", [])
-        if isinstance(s, dict)
-    ]
-    return HarvestResult(
-        selected_tomato_id=parsed.get("selected_tomato_id", -1),
-        reasoning=parsed.get("reasoning", ""),
-        tomato_scores=scores,
+def _parse_harvest_score(
+    raw: str,
+    fallback_id: int,
+    bbox: list[int | float],
+) -> TomatoScore:
+    parsed = parse_output(raw) or {}
+    try:
+        tomato_id = int(parsed.get("id", fallback_id))
+    except Exception:
+        tomato_id = fallback_id
+
+    ripeness_score = _safe_int_score(parsed.get("ripeness_score"), 0)
+    visibility_score = _safe_int_score(parsed.get("visibility_score"), 0)
+    isolation_score = _safe_int_score(parsed.get("isolation_score"), 0)
+    total_score = ripeness_score + visibility_score + isolation_score
+
+    return TomatoScore(
+        id=tomato_id,
+        ripeness_score=ripeness_score,
+        visibility_score=visibility_score,
+        isolation_score=isolation_score,
+        total_score=total_score,
+        bbox_area=_bbox_area(bbox),
         raw=raw,
     )
 
@@ -228,22 +280,28 @@ def predict(
     model,
     tokenizer,
 ) -> HarvestResult | None:
-    """이미지와 ripe_tomatoes를 받아 수확 선택 결과를 반환합니다.
+    """ripe 토마토별 점수를 예측하고, total_score 기준으로 최종 수확 대상을 반환합니다.
 
-    Args:
-        pil_image: 원본 PIL 이미지.
-        ripe_tomatoes: [{"id": int, "bbox": [x1, y1, x2, y2]}, ...].
-        model: load_model()로 얻은 모델.
-        tokenizer: load_model()로 얻은 토크나이저.
-
-    Returns:
-        HarvestResult, 또는 파싱 실패 시 None.
+    total_score가 같으면 bbox 면적이 더 큰 토마토를 선택합니다.
     """
     if not ripe_tomatoes:
         return None
 
-    raw = run_inference(pil_image, ripe_tomatoes, model, tokenizer)
-    parsed = parse_output(raw)
-    if parsed is None:
+    raw_outputs = run_inference(pil_image, ripe_tomatoes, model, tokenizer)
+    scores = [
+        _parse_harvest_score(raw, fallback_id=tomato["id"], bbox=tomato["bbox"])
+        for raw, tomato in zip(raw_outputs, ripe_tomatoes)
+    ]
+    if not scores:
         return None
-    return _dict_to_result(parsed, raw)
+
+    selected = max(scores, key=lambda s: (s.total_score, s.bbox_area))
+    raw_summary = json.dumps(
+        {"per_candidate_raw_outputs": {str(t["id"]): raw for t, raw in zip(ripe_tomatoes, raw_outputs)}},
+        ensure_ascii=False,
+    )
+    return HarvestResult(
+        selected_tomato_id=selected.id,
+        tomato_scores=scores,
+        raw=raw_summary,
+    )

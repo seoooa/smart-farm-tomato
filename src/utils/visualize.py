@@ -33,7 +33,7 @@ import numpy as np
 
 # ── 기본 색상 (BGR) ───────────────────────────────────────────────────────
 COLOR_RIPEN   = (0,   0, 220)    # 빨강
-COLOR_UNRIPEN = (110, 110, 110)  # 회색
+COLOR_UNRIPEN = (255, 255, 255)  # 흰색
 COLOR_ERROR   = (128, 128, 128)  # 회색
 COLOR_HARVEST = (0,  230,  50)   # 라임  (selected)
 
@@ -79,9 +79,10 @@ def draw_bboxes(
         박스가 그려진 BGR ndarray (원본의 복사본)
     """
     vis = img_bgr.copy()
-    font      = cv2.FONT_HERSHEY_SIMPLEX
-    txt_color = (0, 255, 255)   # 노란색
-    bg_color  = (0, 0, 0)       # 검정 solid 배경
+    font        = cv2.FONT_HERSHEY_SIMPLEX
+    txt_color   = (0, 255, 255)  # 노란색
+    bg_color    = (0, 0, 0)      # 검정
+    bg_alpha    = 0.55           # 텍스트 배경 불투명도 (낮을수록 더 투명)
 
     for spec in specs:
         x1, y1, x2, y2 = spec.xyxy
@@ -93,13 +94,13 @@ def draw_bboxes(
             line_h = th + bl + 4
             ty     = max(y1 - 4 - j * line_h, th + 4)
 
-            # 검정 solid 배경
-            cv2.rectangle(
-                vis,
-                (x1, ty - th - bl - 2),
-                (x1 + tw + 4, ty + bl + 1),
-                bg_color, -1,
-            )
+            # 반투명 검정 배경
+            bx1, by1 = x1,          ty - th - bl - 2
+            bx2, by2 = x1 + tw + 4, ty + bl + 1
+            overlay = vis.copy()
+            cv2.rectangle(overlay, (bx1, by1), (bx2, by2), bg_color, -1)
+            cv2.addWeighted(overlay, bg_alpha, vis, 1 - bg_alpha, 0, vis)
+
             # 노란 텍스트
             cv2.putText(
                 vis, txt, (x1 + 2, ty),
@@ -150,10 +151,12 @@ def ripeness_to_specs(ripeness_results: list[tuple]) -> list[BBoxSpec]:
             else COLOR_UNRIPEN if lbl == "unripe"
             else COLOR_ERROR
         )
+        thickness = 2 if lbl in ("ripe", "unripe") else 1
         specs.append(BBoxSpec(
             xyxy=(cx1, cy1, cx2, cy2),
             lines=[f"#{i + 1}  {conf:.2f}"],
             color=color,
+            thickness=thickness,
         ))
     return specs
 
